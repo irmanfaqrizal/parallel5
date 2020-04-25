@@ -123,7 +123,50 @@ int main(int argc, char *argv[])
     double *local_B = (double *)malloc(sizeof(double) * dataEachP);
     double *local_C = (double *)malloc(sizeof(double) * dataEachP);
 
-// #ifdef CHECK_CORRECTNESS
+#ifdef PERF_EVAL
+    for (exp = 0 ; exp < NBEXPERIMENTS; exp++) {
+        if(my_rank == 0) {
+            initMatrix(mat_size, A);
+            initMatrix(mat_size, B);
+            initMatrixZero(mat_size, C);
+            start = MPI_Wtime();
+            sequentialMatrixMultiplication_REF(mat_size, A, B , C);       
+            experiments [exp] = MPI_Wtime() - start;
+        }
+    }
+
+    if(my_rank == 0) {
+        av = average_time() ;  
+        printf ("\n REF sequential time \t\t\t %.3lf seconds\n\n", av) ;
+    }
+    
+    for (exp = 0 ; exp < NBEXPERIMENTS; exp++) {
+        if(my_rank == 0) {
+            initMatrix(mat_size, A);
+            initMatrix(mat_size, B);
+            initMatrixZero(mat_size, C);
+        }
+        // Distribute the matrices to all processes
+        MPI_Scatter( A, dataEachP, MPI_DOUBLE, local_A, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Scatter( B, dataEachP, MPI_DOUBLE, local_B, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Scatter( C, dataEachP, MPI_DOUBLE, local_C, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        
+        if(my_rank == 0) {
+            start = MPI_Wtime();
+            parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
+            experiments [exp] = MPI_Wtime() - start;
+        } else {
+            parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
+        }  
+    }
+
+    if(my_rank == 0) {
+        av = average_time() ;  
+        printf ("\n my mat_mult \t\t\t %.3lf seconds\n\n", av) ;
+    }
+#endif /*PERF_EVAL*/
+
+#ifdef CHECK_CORRECTNESS
     /* running my sequential implementation of the matrix
        multiplication */
     if(my_rank == 0) {
@@ -136,22 +179,15 @@ int main(int argc, char *argv[])
         initMatrixZero(mat_size, C_check);
     }
 
-    // Distribute the matrix to all processes (scattered because a process needs portion of the matrix)
+    // Distribute the matrices to all processes
     MPI_Scatter( A, dataEachP, MPI_DOUBLE, local_A, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Scatter( B, dataEachP, MPI_DOUBLE, local_B, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Scatter( C, dataEachP, MPI_DOUBLE, local_C, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     /* check for correctness */
     if(my_rank == 0) {
-
-        //sequentialMatrixMultiplication(mat_size, A, B , C);
         parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
         sequentialMatrixMultiplication_REF(mat_size, A_check, B_check , C_check);
-        printf("Result ");
-        printMatrix(mat_size, C);
-        printf("Expected ");
-        printMatrix(mat_size, C_check);
-
         if(checkMatricesEquality(mat_size, C, C_check)) {
             printf("\t CORRECT matrix multiplication result \n");
         } else {
@@ -165,7 +201,7 @@ int main(int argc, char *argv[])
         parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
     }
 
-// #endif /* CHECK_CORRECTNESS */
+#endif /* CHECK_CORRECTNESS */
 
     if(my_rank == 0) {
         free(A);
