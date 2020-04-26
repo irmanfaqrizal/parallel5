@@ -1,88 +1,111 @@
 #include <stdio.h>
 #include <mpi.h>
+#include <math.h>
 #include <stdlib.h>
 #include "utils.h"
 #include <string.h>
+#include <stdbool.h> 
 
-/* a matrix multiplication without locality (column-first)*/
-void sequentialMatrixMultiplication(int dimension, double *A, double *B, double *C)
-{
-    int i = 0;
-    int j = 0;
-    int k = 0;
+typedef struct {
+    MPI_Comm  grid;                  // Communicator for entire grid
+    MPI_Comm  row;                   // Communicator for specific row in the grid 
+    MPI_Comm  col;                   // Communicator for specific column in the grid
+    int       rowPosition;           // local row coordinate
+    int       columnPosition;        // local column coordinate
+    int       gridRank;              // rank for each processor
+} COMMS;
 
-    for (i = 0; i < dimension; i++) {
-        for (j = 0; j < dimension; j++) {
-            for (k = 0; k < dimension; k++) {
-                C[i + j * dimension] += A[i + k * dimension] * B[k + j*dimension];
-            }
-        }
-    }
+void initCommunicators(COMMS* comms, int w_size) {
+    int dimensions[2];
+    int period[2];
+    int coordinates[2];
+    int freeCoordinates[2];
+    dimensions[0] = dimensions[1] = (int) sqrt(w_size);
+    period[0] = period[1] = 1;
+
+    // We first create the global communicator, then we assign a rank to each processor
+    // Use this two to get the coordinates for each processor (rows and column)
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dimensions, period, 1, &(comms->grid));
+    MPI_Comm_rank(comms->grid, &(comms->gridRank));
+    MPI_Cart_coords(comms->grid, comms->gridRank, 2, coordinates);
+    comms->rowPosition = coordinates[0];
+    comms->columnPosition = coordinates[1];
+
+    // Assign communicator for rows and cols
+    freeCoordinates[0] = 0; 
+    freeCoordinates[1] = 1;
+    MPI_Cart_sub(comms->grid, freeCoordinates, &(comms->row));
+    freeCoordinates[0] = 1; 
+    freeCoordinates[1] = 0;
+    MPI_Cart_sub(comms->grid, freeCoordinates, &(comms->col));
 }
 
-int mod(int a, int b)
-{
-    int r = a % b;
-    return r < 0 ? r + b : r;
-}
-
-/* parallel matrix multiplication */
-void parallelMatrixMultiplication(int dimension, double *locA, double *locB, double *locC, int rank, int size, double *global_C)
+/* fox matrix multiplication */
+void foxMatrixMultiplication(COMMS *comms, int dimension,
+    double *locA, double *locB, double *locC, int rank, int size, double *global_C)
 {   
-    // Set from which process we will receive B
-    int receiveFrom = 0;
-    if (rank == 0) {receiveFrom = (size-1)%size; }
-    else {receiveFrom = rank - 1;}
+    int recvSource;		
+	int sendDestination;		
+	int root = 0;
+	bool isOnDiagonal = false;
+	MPI_Status status;
 
-    // Request and status
-    MPI_Request request1, request2;
-    MPI_Status status;
+	// size of a block is a dimension of the number of process
+	int sqroot = (int) sqrt(size);
 
-    // Compute number of rows for each process, then compute how many data (cell) for each process
-    int r = dimension / size;
-    int dataEachP = r * dimension;
+	// Compute the source and destination to shift the blocks in earch iteration
+	recvSource = (comms->rowPosition + 1) % sqroot;
+	sendDestination = (comms->rowPosition - 1 + sqroot ) % sqroot;
+	
+	// Temporary matrices : init with zeros
+	double* temp_A = malloc(size * sizeof(double));
+	double* temp_B = malloc(size * sizeof(double));
+	int i;
+	for(i=0; i < size; ++i) {
+		temp_A[i] = 0.;
+		temp_B[i] = 0.;
+	}
 
-    // Temporary send and receive to another process
-    double *tempS = (double *)malloc(sizeof(double) * dataEachP);
-    memcpy(tempS, locB, sizeof(double) * dataEachP);
-    double *tempR = (double *)malloc(sizeof(double) * dataEachP);
+	// Make sure every process initialized before start the algorithm
+	MPI_Barrier(comms->row);		
+	
+    // start iterations
+	for(i = 0; i < sqroot; i++ ) {
 
-    // Loop P (size) times
-    for (int step = 0; step < size; step++) {
-
-        // Send and receive B matrix (we have to wait for each of them finished)
-        MPI_Isend(tempS, dataEachP, MPI_DOUBLE, (rank+1)%size, 0, MPI_COMM_WORLD, &request1);
-        MPI_Wait(&request1, &status);
-        MPI_Irecv(tempR, dataEachP, MPI_DOUBLE, receiveFrom, 0, MPI_COMM_WORLD, &request2);
-        MPI_Wait(&request2, &status);
-
-        // Compute matrix C for every process
-        int block = mod((rank-step), size);
-        for (int l = 0; l < size; l++) {
-            for (int i = 0; i < r; i++) {
-                for (int j = 0; j < r; j++) {
-                    for (int k = 0; k < r; k++) {
-                        locC[(i*dimension) + (l*r+j)] = locC[(i*dimension) + (l*r+j)] + locA[(i*dimension) + (block*r+k)] * tempS [(k*dimension) + (l*r+j)];
-                    }
-                }
-            }
+        // Broadcast block A
+		root = (comms->rowPosition + i)%sqroot;
+		if( root == comms->columnPosition ){
+			MPI_Bcast( locA, size, MPI_DOUBLE, root, comms->row);
+			isOnDiagonal = true;	
+		} else{
+			MPI_Bcast(temp_A, size, MPI_DOUBLE, root, comms->row );
+			isOnDiagonal = false;
+		}
+		
+        // Multply block A with B if is on diagonal, and temp A with B if its not
+        int ind, j, k;
+        if (isOnDiagonal) {
+            for (ind = 0; ind < sqroot; ind++)
+                for (j = 0; j < sqroot; j++)
+                        for (k = 0; k < sqroot; k++)
+                            locC[ind*sqroot+j] += locA[ind*sqroot+k]*locB[k*sqroot+j];
+        } else {
+            for (ind = 0; ind < sqroot; ind++)
+                for (j = 0; j < sqroot; j++)
+                        for (k = 0; k < sqroot; k++)
+                            locC[ind*sqroot+j] += temp_A[ind*sqroot+k]*locB[k*sqroot+j];
         }
-        // // To print the values in each iteration :
-        // printf("Step : %d, block:%d. Proc %d/%d sendTo:%d, recvFrom:%d, A : %.1lf %.1lf %.1lf %.1lf"
-        // ", B : %.1lf %.1lf %.1lf %.1lf, C : %.1lf %.1lf %.1lf %.1lf\n",
-        //     step, block, rank, size, (rank+1)%size, receiveFrom, locA[0], locA[1], locA[2], locA[3],
-        //     tempS[0], tempS[1], tempS[2], tempS[3], locC[0], locC[1], locC[2], locC[3]
-        //     );
-
-        // Copy tempR to send a new B in the next step
-        memcpy(tempS, tempR, sizeof(double) * dataEachP);
-    }
-    
-    // free the temps and then gather every rows in C to process 0
-    free(tempS);
-    free(tempR);
-    MPI_Gather(locC, dataEachP, MPI_DOUBLE, global_C, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	
+        // shift the blocks vertically for next iteration
+		MPI_Send( locB, size, MPI_DOUBLE, sendDestination, 0, comms->col);
+		MPI_Recv( temp_B, size, MPI_DOUBLE, recvSource, 0,comms->col, &status);
+		int z;
+		for(z = 0; z < size; ++z)
+			locB[z] = temp_B[z]; 
+	}
 }
+
+
 
 int main(int argc, char *argv[])
 {
@@ -95,19 +118,22 @@ int main(int argc, char *argv[])
     int w_size;
     double start=0, av=0;
 
+    // Check Arguments
+    if(argc != 2) {
+        printf("usage: %s matrix_size\n",argv[0]);
+        return 0;
+    } else {
+        mat_size = atoi(argv[1]);
+    }
+
     // Init MPI
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &w_size);
 
-    // Check Arguments
-    if(argc != 2) {
-        printf("usage: %s matrix_size\n",argv[0]);
-        MPI_Finalize();
-        return 0;
-    } else {
-        mat_size = atoi(argv[1]);
-    }
+    // Init grid informations and communicators
+    COMMS comms;
+    initCommunicators(&comms, w_size);
 
     // Allocate the matrix (for rank 0)
     if(my_rank == 0) {
@@ -117,58 +143,47 @@ int main(int argc, char *argv[])
         C = allocMatrix(mat_size);
     }
 
-    // Allocate rows in each process
+    // Setting parameters for creating a new datatype
+    MPI_Datatype blocktype, type;	
+	int arraySize[2] = {w_size, w_size};
+	int subarraySizes[2] = {(int)sqrt(w_size), (int) sqrt(w_size)};
+	int arrayStart[2] = {0,0};
+
+    // the array size will be number of process x number of process, and sub arrays are the square roots of them
+    // 'blocktype' will return a new datatype, but then we resized this into 'type'
+    // then we have to commit using MPI_Type_commit
+	MPI_Type_create_subarray(2, arraySize, subarraySizes, arrayStart, MPI_ORDER_C, MPI_DOUBLE, &blocktype); 
+	MPI_Type_create_resized(blocktype, 0, (int)sqrt(w_size)*sizeof(double), &type);
+	MPI_Type_commit(&type);
+
+    // Allocate blocks in each process
     int dataEachP = mat_size*mat_size/w_size;
     double *local_A = (double *)malloc(sizeof(double) * dataEachP);
     double *local_B = (double *)malloc(sizeof(double) * dataEachP);
     double *local_C = (double *)malloc(sizeof(double) * dataEachP);
 
-#ifdef PERF_EVAL
-    for (exp = 0 ; exp < NBEXPERIMENTS; exp++) {
-        if(my_rank == 0) {
-            initMatrix(mat_size, A);
-            initMatrix(mat_size, B);
-            initMatrixZero(mat_size, C);
-            start = MPI_Wtime();
-            sequentialMatrixMultiplication_REF(mat_size, A, B , C);       
-            experiments [exp] = MPI_Wtime() - start;
-        }
-    }
+    // Set up the parameters for scatterv
+    // sendcounts contains an array of how much data will be sent for each process
+    // displs will specify from which part of the global data (process 0) another process will take
+	int sendcounts[w_size];
+    int displs[w_size];
+    int i, j;
+    if (my_rank == 0) {
+		for(i=0; i<w_size; i++)  {
+			sendcounts[i] = 1;
+		}
 
-    if(my_rank == 0) {
-        av = average_time() ;  
-        printf ("\n REF sequential time \t\t\t %.3lf seconds\n\n", av) ;
-    }
-    
-    for (exp = 0 ; exp < NBEXPERIMENTS; exp++) {
-        if(my_rank == 0) {
-            initMatrix(mat_size, A);
-            initMatrix(mat_size, B);
-            initMatrixZero(mat_size, C);
-        }
-        // Distribute the matrices to all processes
-        MPI_Scatter( A, dataEachP, MPI_DOUBLE, local_A, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Scatter( B, dataEachP, MPI_DOUBLE, local_B, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Scatter( C, dataEachP, MPI_DOUBLE, local_C, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        
-        if(my_rank == 0) {
-            start = MPI_Wtime();
-            parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
-            experiments [exp] = MPI_Wtime() - start;
-        } else {
-            parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
-        }  
-    }
+		int disp = 0;
+		for (i=0; i<(int)sqrt(w_size); i++) {
+			for (j=0; j<(int)sqrt(w_size); j++) {
+				displs[i*(int)sqrt(w_size)+j] = disp;
+				disp += 1;
+			}
+			disp += ((w_size/(int)sqrt(w_size)-1))*(int)sqrt(w_size);
+		}
+	}
 
-    if(my_rank == 0) {
-        av = average_time() ;  
-        printf ("\n my mat_mult \t\t\t %.3lf seconds\n\n", av) ;
-    }
-#endif /*PERF_EVAL*/
-
-#ifdef CHECK_CORRECTNESS
-    /* running my sequential implementation of the matrix
-       multiplication */
+    // init matrices
     if(my_rank == 0) {
         initMatrix(mat_size, A);
         initMatrix(mat_size, B);
@@ -179,15 +194,19 @@ int main(int argc, char *argv[])
         initMatrixZero(mat_size, C_check);
     }
 
-    // Distribute the matrices to all processes
-    MPI_Scatter( A, dataEachP, MPI_DOUBLE, local_A, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Scatter( B, dataEachP, MPI_DOUBLE, local_B, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Scatter( C, dataEachP, MPI_DOUBLE, local_C, dataEachP, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    // Scatter to all processes
+    MPI_Scatterv(A, sendcounts, displs, MPI_DOUBLE, local_A, w_size, MPI_DOUBLE, 0, MPI_COMM_WORLD);	
+	MPI_Scatterv(B, sendcounts, displs, MPI_DOUBLE, local_B, w_size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // Run the function and gather the result
+    foxMatrixMultiplication(&comms, mat_size, local_A, local_B, local_C, my_rank, w_size, C);
+    MPI_Gatherv(local_C, w_size,  MPI_DOUBLE, C, sendcounts, displs, type, 0, MPI_COMM_WORLD);
 
     /* check for correctness */
-    if(my_rank == 0) {
-        parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
+    if(my_rank == 0) {   
         sequentialMatrixMultiplication_REF(mat_size, A_check, B_check , C_check);
+        printMatrix(mat_size, C);
+        printMatrix(mat_size, C_check);
         if(checkMatricesEquality(mat_size, C, C_check)) {
             printf("\t CORRECT matrix multiplication result \n");
         } else {
@@ -197,11 +216,7 @@ int main(int argc, char *argv[])
         free(A_check);
         free(B_check);
         free(C_check);
-    } else {
-        parallelMatrixMultiplication(mat_size, local_A, local_B, local_C, my_rank, w_size, C);
     }
-
-#endif /* CHECK_CORRECTNESS */
 
     if(my_rank == 0) {
         free(A);

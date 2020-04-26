@@ -42,7 +42,7 @@ all: $(EXEC)
 %.run: $(HEADER_FILES)
 
 %.run: %.c $(EXTRA_SRC)
-	$(CC) -o $@ $^ $(CONFIG_FLAGS)
+	$(CC) -o $@ $^ $(CONFIG_FLAGS) -lm
 
 clean:
 	rm -f $(EXEC) *.o *~
